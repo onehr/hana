@@ -12,7 +12,7 @@ use super::vm::Vm;
 
 // node
 #[derive(PartialEq)]
-pub enum GcNodeColor {
+enum GcNodeColor {
     White,
     Gray,
     Black,
@@ -25,7 +25,7 @@ struct GcNode {
     pub color: GcNodeColor,
     // if the node is unreachable, it will be pruned (free'd)
     pub native_refs: usize,
-    tracer: GenericTracer,
+    tracer: GenericFunction,
     // tracer gets called sweep phased (FIXME)
     finalizer: GenericFunction,
     // finalizer gets called with a pointer to
@@ -42,13 +42,10 @@ impl GcNode {
 
 }
 
-
 type GenericFunction = fn(*mut c_void);
 // a generic function that takes in some pointer
 // this might be a finalizer or a tracer function
 // TODO maybe replace this with Any
-
-type GenericTracer = fn(*mut c_void, GcNodeColor);
 
 // manager
 const INITIAL_THRESHOLD: usize = 100;
@@ -61,6 +58,7 @@ struct GcManager {
     // multithread
     gc_thread: Option<thread::JoinHandle<()>>,
     gc_recv: Option<Receiver<bool>>,
+    gc_gray_nodes: Vec<*mut GcNode>, // keep a list for the gc_thread
 
     // data
     root: *mut Vm,
@@ -77,6 +75,7 @@ impl GcManager {
             last_node: null_mut(),
             gc_thread: None,
             gc_recv: None,
+            gc_gray_nodes: Vec::new(),
             root: null_mut(),
             bytes_allocated: 0,
             threshold: INITIAL_THRESHOLD,
@@ -172,19 +171,22 @@ impl GcManager {
             }
             node = next;
         }
+        // mark nodes from the root
+        let vm = &mut *self.root;
+        vm.mark();
         // the main thread is free to do its thing now
-        // we'll spawn our own thread to finish things up
+        // -> we'll spawn our own thread to finish things up
+        // setup
         let (sender, recv) = channel();
         self.gc_recv = Some(recv);
+        let gray_nodes = self.gc_gray_nodes;
+        // spawn
         self.gc_thread = Some(thread::spawn(move || {
-            // mark everything as
-
+            thread::sleep(std::time::Duration::from_secs(1000));
             // we're done
             sender.send(true).unwrap();
         }));
         /*
-        let vm = &mut *self.root;
-        vm.mark();
         // sweep phase:
         let mut node : *mut GcNode = self.first_node;
         while !node.is_null() {
@@ -214,12 +216,13 @@ impl GcManager {
     }
 
     // ## marking
-    pub unsafe fn mark_reachable(ptr: *mut c_void) -> bool {
+    pub unsafe fn mark_reachable(&mut self, ptr: *mut c_void) -> bool {
         // => start byte
         if ptr.is_null() { return false; }
         let node : *mut GcNode = (ptr as *mut GcNode).sub(1);
         if (*node).color == GcNodeColor::Gray { return false; }
         (*node).color = GcNodeColor::Gray;
+        self.gc_gray_nodes.push(ptr);
         true
     }
 
@@ -326,7 +329,7 @@ impl<T: Sized + GcTraceable> std::clone::Clone for Gc<T> {
 }
 
 pub trait GcTraceable {
-    fn trace(ptr: *mut libc::c_void, color: GcNodeColor);
+    fn trace(ptr: *mut libc::c_void);
 }
 
 // native traceables
@@ -383,5 +386,10 @@ pub unsafe fn ref_dec(ptr: *mut c_void) {
 }
 
 pub unsafe fn mark_reachable(ptr: *mut c_void) -> bool {
-    GcManager::mark_reachable(ptr)
+    let ret = false;
+    GC_MANAGER.with(|gc_manager| {
+        let mut gc_manager = gc_manager.borrow_mut();
+        ret = gc_manager.mark_reachable(ptr);
+    });
+    ret
 }
