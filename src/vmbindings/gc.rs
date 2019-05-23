@@ -6,7 +6,9 @@
 use std::ptr::{null_mut, drop_in_place};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::thread;
-use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
+use std::sync::mpsc::{sync_channel, Sender, Receiver, TryRecvError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 pub use libc::c_void;
 use super::vm::Vm;
 
@@ -57,8 +59,7 @@ struct GcManager {
 
     // multithread
     gc_thread: Option<thread::JoinHandle<()>>,
-    gc_recv: Option<Receiver<bool>>,
-    gc_gray_nodes: Vec<*mut GcNode>, // keep a list for the gc_thread
+    gc_avail: Arc<AtomicBool>,
 
     // data
     root: *mut Vm,
@@ -74,8 +75,7 @@ impl GcManager {
             first_node: null_mut(),
             last_node: null_mut(),
             gc_thread: None,
-            gc_recv: None,
-            gc_gray_nodes: Vec::new(),
+            gc_avail: Arc::new(AtomicBool::new(false)),
             root: null_mut(),
             bytes_allocated: 0,
             threshold: INITIAL_THRESHOLD,
@@ -133,32 +133,19 @@ impl GcManager {
     // gc algorithm
     unsafe fn collect(&mut self) {
         if !self.enabled { return; }
-        if let Some(gc_thread) = &self.gc_thread {
-            // the thread should have sent something when it exits
-            if let Some(gc_recv) = &self.gc_recv {
-                // if it didn't send anything => thread is still alive
-                match gc_recv.try_recv() {
-                    Ok(x) => {
-                        eprintln!("complete: {}", x);
-                    },
-                    Err(e) => {
-                        match e {
-                            TryRecvError::Disconnected => {
-                                eprintln!("thread is ded {}", e);
-                                return;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
+        /* if !self.gc_avail.load(Ordering::Relaxed) {
+            //eprintln!("complete");
+            return;
+        } */
         // mark phase:
         let mut node : *mut GcNode = self.first_node;
+        // store all nodes here, and filter later:
+        let mut gray_nodes = Vec::new();
         // reset all nodes
         while !node.is_null() {
             let next : *mut GcNode = (*node).next;
             (*node).color = GcNodeColor::White;
+            gray_nodes.push(node);
             node = next;
         }
         // mark nodes with at least one native reference as gray
@@ -174,18 +161,11 @@ impl GcManager {
         // mark nodes from the root
         let vm = &mut *self.root;
         vm.mark();
+        // get gray nodes
+        gray_nodes.retain(|&node| (*node).color == GcNodeColor::Gray);
         // the main thread is free to do its thing now
-        // -> we'll spawn our own thread to finish things up
-        // setup
-        let (sender, recv) = channel();
-        self.gc_recv = Some(recv);
-        let gray_nodes = self.gc_gray_nodes;
-        // spawn
-        self.gc_thread = Some(thread::spawn(move || {
-            thread::sleep(std::time::Duration::from_secs(1000));
-            // we're done
-            sender.send(true).unwrap();
-        }));
+        // the gc thread should do the trick now
+        //self.send
         /*
         // sweep phase:
         let mut node : *mut GcNode = self.first_node;
@@ -216,13 +196,12 @@ impl GcManager {
     }
 
     // ## marking
-    pub unsafe fn mark_reachable(&mut self, ptr: *mut c_void) -> bool {
+    pub unsafe fn mark_reachable(ptr: *mut c_void) -> bool {
         // => start byte
         if ptr.is_null() { return false; }
         let node : *mut GcNode = (ptr as *mut GcNode).sub(1);
         if (*node).color == GcNodeColor::Gray { return false; }
         (*node).color = GcNodeColor::Gray;
-        self.gc_gray_nodes.push(ptr);
         true
     }
 
@@ -386,10 +365,5 @@ pub unsafe fn ref_dec(ptr: *mut c_void) {
 }
 
 pub unsafe fn mark_reachable(ptr: *mut c_void) -> bool {
-    let ret = false;
-    GC_MANAGER.with(|gc_manager| {
-        let mut gc_manager = gc_manager.borrow_mut();
-        ret = gc_manager.mark_reachable(ptr);
-    });
-    ret
+    GcManager::mark_reachable(ptr)
 }
