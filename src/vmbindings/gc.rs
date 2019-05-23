@@ -1,17 +1,31 @@
+// simple tricolor marked concurrent gc
+// references:
+//  https://www.memorymanagement.org/glossary/t.html#tri.color.marking
+//  https://making.pusher.com/golangs-real-time-gc-in-theory-and-practice/
+
 use std::ptr::{null_mut, drop_in_place};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::thread;
+use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
 pub use libc::c_void;
 use super::vm::Vm;
 
 // node
+#[derive(PartialEq)]
+pub enum GcNodeColor {
+    White,
+    Gray,
+    Black,
+}
+
 struct GcNode {
     prev: *mut GcNode,
     next: *mut GcNode,
     size: usize,
-    unreachable: bool, // by default this is false
+    pub color: GcNodeColor,
     // if the node is unreachable, it will be pruned (free'd)
     pub native_refs: usize,
-    tracer: GenericFunction,
+    tracer: GenericTracer,
     // tracer gets called sweep phased (FIXME)
     finalizer: GenericFunction,
     // finalizer gets called with a pointer to
@@ -28,17 +42,27 @@ impl GcNode {
 
 }
 
+
 type GenericFunction = fn(*mut c_void);
 // a generic function that takes in some pointer
 // this might be a finalizer or a tracer function
 // TODO maybe replace this with Any
 
+type GenericTracer = fn(*mut c_void, GcNodeColor);
+
 // manager
 const INITIAL_THRESHOLD: usize = 100;
 const USED_SPACE_RATIO: f64 = 0.7;
 struct GcManager {
+    // linked list
     first_node: *mut GcNode,
     last_node: *mut GcNode,
+
+    // multithread
+    gc_thread: Option<thread::JoinHandle<()>>,
+    gc_recv: Option<Receiver<bool>>,
+
+    // data
     root: *mut Vm,
     bytes_allocated: usize,
     threshold: usize,
@@ -51,6 +75,8 @@ impl GcManager {
         GcManager {
             first_node: null_mut(),
             last_node: null_mut(),
+            gc_thread: None,
+            gc_recv: None,
             root: null_mut(),
             bytes_allocated: 0,
             threshold: INITIAL_THRESHOLD,
@@ -86,6 +112,7 @@ impl GcManager {
             self.last_node = bytes;
         }
         (*bytes).native_refs = 1;
+        (*bytes).color = GcNodeColor::Gray;
         (*bytes).tracer = T::trace;
         (*bytes).finalizer = finalizer;
         (*bytes).size = GcNode::alloc_size::<T>();
@@ -107,25 +134,55 @@ impl GcManager {
     // gc algorithm
     unsafe fn collect(&mut self) {
         if !self.enabled { return; }
+        if let Some(gc_thread) = &self.gc_thread {
+            // the thread should have sent something when it exits
+            if let Some(gc_recv) = &self.gc_recv {
+                // if it didn't send anything => thread is still alive
+                match gc_recv.try_recv() {
+                    Ok(x) => {
+                        eprintln!("complete: {}", x);
+                    },
+                    Err(e) => {
+                        match e {
+                            TryRecvError::Disconnected => {
+                                eprintln!("thread is ded {}", e);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
         // mark phase:
         let mut node : *mut GcNode = self.first_node;
         // reset all nodes
         while !node.is_null() {
             let next : *mut GcNode = (*node).next;
-            (*node).unreachable = true;
+            (*node).color = GcNodeColor::White;
             node = next;
         }
-        // mark make nodes with at least one native reference
+        // mark nodes with at least one native reference as gray
         node = self.first_node;
         while !node.is_null() {
             let next : *mut GcNode = (*node).next;
             if (*node).native_refs > 0 {
-                (*node).unreachable = false;
+                (*node).color = GcNodeColor::Gray;
                 ((*node).tracer)(node.add(1) as *mut c_void);
             }
             node = next;
         }
-        // mark from root
+        // the main thread is free to do its thing now
+        // we'll spawn our own thread to finish things up
+        let (sender, recv) = channel();
+        self.gc_recv = Some(recv);
+        self.gc_thread = Some(thread::spawn(move || {
+            // mark everything as
+
+            // we're done
+            sender.send(true).unwrap();
+        }));
+        /*
         let vm = &mut *self.root;
         vm.mark();
         // sweep phase:
@@ -153,7 +210,7 @@ impl GcManager {
                 dealloc(node as *mut u8, layout);
             }
             node = next;
-        }
+        }*/
     }
 
     // ## marking
@@ -161,8 +218,8 @@ impl GcManager {
         // => start byte
         if ptr.is_null() { return false; }
         let node : *mut GcNode = (ptr as *mut GcNode).sub(1);
-        if !(*node).unreachable { return false; }
-        (*node).unreachable = false;
+        if (*node).color == GcNodeColor::Gray { return false; }
+        (*node).color = GcNodeColor::Gray;
         true
     }
 
@@ -269,7 +326,7 @@ impl<T: Sized + GcTraceable> std::clone::Clone for Gc<T> {
 }
 
 pub trait GcTraceable {
-    fn trace(ptr: *mut libc::c_void);
+    fn trace(ptr: *mut libc::c_void, color: GcNodeColor);
 }
 
 // native traceables
